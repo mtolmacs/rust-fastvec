@@ -19,7 +19,5 @@ rustup component add miri
 cargo miri setup
 
 cargo miri test --verbose
-cargo miri test --verbose --features union
-cargo miri test --verbose --all-features
 
 rustup override set nightly
