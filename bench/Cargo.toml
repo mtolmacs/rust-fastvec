@@ -1,0 +1,25 @@
+[package]
+name = "fastvec-bench"
+description = "Benchmaring for the fastvec crate"
+version = "0.1.0"
+publish = false
+authors = ["Mark Tolmacs <mark@lazycat.hu>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[dependencies]
+bma-benchmark = "0.0.20"
+smallvec = "1.10.0"
+
+[dependencies.fastvec]
+path = ".."
+
+[[bin]]
+name = "fastvec-bench"
+path = "src/main.rs"
+test = false
+doc = false
