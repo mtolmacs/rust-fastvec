@@ -1,26 +1,24 @@
-use crate::{error::Error, stack::Stack};
+use crate::{error::Error};
 use std::{
     alloc::{alloc, dealloc, realloc, Layout},
+    mem::{ManuallyDrop, MaybeUninit},
     ptr::{self, NonNull},
 };
 
-// NOTE: `cap` could be used for storage when we use the stack storage, saving a
-// pointer-sized memory span by moving it to the heap when the buffer is heap
-// allocated. However at that point `cap` needs a pointer dereference (at least)
-// to get the value, which is slower.
-struct Header<T, const N: usize> {
-    cap: usize,
-    len: usize,
-    ptr: NonNull<T>,
+union Data<T, const N: usize>
+where
+    T: Unpin,
+{
+    stack: ManuallyDrop<MaybeUninit<[T; N]>>,
+    heap: (*mut T, usize),
 }
 
 pub struct FastVec<T, const N: usize>
 where
     T: Unpin,
 {
-    header: Header<T, N>,
-    // Stack address shouldn't change, so no need for Pin
-    _stack: Stack<T, N>,
+    capacity: usize,
+    data: Data<T, N>,
 }
 
 impl<T, const N: usize> FastVec<T, N>
@@ -34,33 +32,37 @@ where
         debug_assert!(N < isize::MAX as usize, "Maximum legnth is isize::MAX");
 
         Self {
-            header: Header {
-                cap: N,
-                len: 0,
-                ptr: NonNull::dangling(),
-            },
-            _stack: Stack::new(),
+            capacity: 0,
+            data: Data { stack: ManuallyDrop::new(MaybeUninit::uninit()) }
         }
     }
 
-    #[inline(always)]
     pub fn len(&self) -> usize {
-        self.header.len
+        unsafe {
+            if self.is_heap_allocated() {
+                let (_, len) = self.data.heap;
+                len
+            } else {
+                self.capacity
+            }
+        }
     }
 
-    #[inline(always)]
     pub fn cap(&self) -> usize {
-        self.header.cap
+        if self.is_heap_allocated() {
+            self.capacity
+        } else {
+            N
+        }
     }
 
-    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn is_heap_allocated(&self) -> bool {
-        self.header.cap > N
+        self.capacity > N
     }
 
     pub fn push(&mut self, value: T) -> Result<(), Error> {
@@ -82,7 +84,11 @@ where
 
             // `len` is never bigger than `cap`,
             // so no need to check for overflow
-            self.header.len += 1;
+            if self.is_heap_allocated() {
+                self.data.heap.1 += 1;
+            } else {
+                self.capacity += 1;
+            }
 
             Ok(())
         }
@@ -92,7 +98,11 @@ where
         unsafe {
             if !self.is_empty() {
                 // This will never underflow, so no need to have checked sub
-                self.header.len -= 1;
+                if self.is_heap_allocated() {
+                    self.data.heap.1 -= 1;
+                } else {
+                    self.capacity -= 1;
+                }
 
                 let value = ptr::read(self.ptr().add(self.len()));
                 Some(value)
@@ -113,26 +123,27 @@ where
         let cap = self.cap() + self.grow_by();
         let ptr = {
             let layout = Layout::array::<T>(cap).map_err(|_| Error::LayoutError)?;
-            NonNull::new(alloc(layout) as *mut T).ok_or(Error::AllocError)?
+            alloc(layout) as *mut T
         };
         // NOTE: We take advantage that MaybeUninit<T> has the same layout and
         // size as T and the fact that we allocated an N * T sized heap buffer.
         // NOTE: No calling drop on T, since we still own the items, just movng them.
-        ptr::copy_nonoverlapping(&mut self._stack as *mut _ as *const T, ptr.as_ptr(), N);
+        ptr::copy_nonoverlapping(&mut self.data.stack as *mut _ as *const T, ptr, N);
 
         // NonNull is just a marker trait, so overwriting it should be equivalent
         // to raw pointer assignment
-        self.header.ptr = ptr;
-        self.header.cap = cap;
+
+        self.data.heap = (ptr, self.capacity);
+        self.capacity = cap;
 
         Ok(())
     }
 
     unsafe fn grow(&mut self, additional: usize) -> Result<(), Error> {
-        debug_assert!(self.header.cap > N, "Not heap allocated");
+        debug_assert!(self.capacity > N, "Not heap allocated");
 
         let layout = Layout::array::<T>(self.cap()).map_err(|_| Error::LayoutError)?;
-        self.header.cap = self
+        self.capacity = self
             .cap()
             .checked_add(additional)
             .ok_or(Error::CapacityOverflow)?;
@@ -147,32 +158,29 @@ where
             return Err(Error::CapacityOverflow);
         }
 
-        let ptr = realloc(self.header.ptr.as_ptr() as *mut u8, layout, size) as *mut T;
-        self.header.ptr = NonNull::new(ptr).ok_or(Error::AllocError)?;
+        let ptr = realloc(self.data.heap.0 as *mut u8, layout, size) as *mut T;
+        self.data.heap.0 = ptr;
 
         Ok(())
     }
 
-    #[inline(always)]
     pub(crate) unsafe fn ptr(&self) -> *const T {
         if self.is_heap_allocated() {
-            self.header.ptr.as_ptr()
+            self.data.heap.0 as *const T
         } else {
-            &self._stack as *const _ as *const T
+            self.data.stack.as_ptr() as *const T
         }
     }
 
-    #[inline(always)]
     pub(crate) unsafe fn ptr_mut(&mut self) -> *mut T {
         if self.is_heap_allocated() {
-            self.header.ptr.as_ptr()
+            self.data.heap.0 as *mut T
         } else {
-            &mut self._stack as *mut _ as *mut T
+            (*self.data.stack).as_mut_ptr() as *mut T
         }
     }
 
     // NOTE: This might be worth optimizing with another heuristics
-    #[inline(always)]
     fn grow_by(&self) -> usize {
         self.cap()
     }
@@ -192,7 +200,7 @@ where
                 // NOTE: This is the current layout, this shouldn't fail.
                 // Unfortunately we don't have a way to gracefully report
                 // errors from drop.
-                let layout = Layout::array::<T>(self.header.cap).unwrap();
+                let layout = Layout::array::<T>(self.capacity).unwrap();
                 dealloc(self.ptr_mut() as *mut u8, layout);
             }
         }

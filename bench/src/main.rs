@@ -87,9 +87,9 @@ fn small_push_pop() {
         assert_eq!(val.1, "A");
     }
 
-    fastvec_small_push_pop();
     vec_small_push_pop();
     smallvec_small_push_pop::<[Test; 3]>();
+    fastvec_small_push_pop();
 }
 
 fn large_push_pop() {
@@ -183,9 +183,9 @@ fn large_push_pop() {
         assert!(buf.pop().is_some()); 
     }
 
-    fastvec_large_push_pop();
-    vec_large_push_pop();
     smallvec_large_push_pop::<[Test; 3]>();
+    vec_large_push_pop();
+    fastvec_large_push_pop();
 }
 
 
