@@ -13,6 +13,23 @@ where
     heap: (*mut T, usize),
 }
 
+impl<T, const N: usize> Data<T, N> where T: Unpin {
+    #[inline(always)]
+    unsafe fn stack(&self) -> *const T {
+        self.stack.as_ptr() as *const T
+    }
+
+    #[inline(always)]
+    unsafe fn stack_mut(&mut self) -> *mut T {
+        self.stack.as_mut_ptr() as *mut T
+    }
+
+    #[inline(always)]
+    unsafe fn heap_mut(&mut self) -> &mut (*mut T, usize) {
+        &mut self.heap
+    }
+}
+
 pub struct FastVec<T, const N: usize>
 where
     T: Unpin,
@@ -39,76 +56,67 @@ where
 
     pub fn len(&self) -> usize {
         unsafe {
-            if self.is_heap_allocated() {
-                let (_, len) = self.data.heap;
-                len
-            } else {
-                self.capacity
-            }
+            let (_, len, _) = self.ptr();
+            len
         }
     }
 
     pub fn cap(&self) -> usize {
-        if self.is_heap_allocated() {
-            self.capacity
-        } else {
-            N
+        unsafe {
+            let (_, _, cap) = self.ptr();
+            cap
         }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    #[inline]
-    pub fn is_heap_allocated(&self) -> bool {
-        self.capacity > N
-    }
-
-    pub fn push(&mut self, value: T) -> Result<(), Error> {
         unsafe {
-            let remaining = self.cap() - self.len();
-            if remaining == 0 {
-                // We need to bump the capacity, potentially move
-                // the buf from stack to heap at this point
-                if self.is_heap_allocated() {
-                    // NOTE: Bump capacity by about 33%, which is a hardcoded
-                    // heuristics, which might be worth revisiting
-                    self.grow(self.grow_by())?;
-                } else {
-                    self.heapify()?;
-                }
-            }
-
-            ptr::write(self.ptr_mut().add(self.len()), value);
-
-            // `len` is never bigger than `cap`,
-            // so no need to check for overflow
-            if self.is_heap_allocated() {
-                self.data.heap.1 += 1;
-            } else {
-                self.capacity += 1;
-            }
-
-            Ok(())
+            let (_, len, _) = self.ptr();
+            len == 0
         }
     }
 
+    #[inline(always)]
+    pub fn is_heap_allocated(&self) -> bool {
+        self.capacity > N        
+    }
+
+    pub fn push(&mut self, value: T) {
+        unsafe {
+            let (mut ptr, mut len, cap) = self.ptr_mut();
+            if *len == cap {
+                // We need to bump the capacity, potentially move
+                // the buf from stack to heap at this point
+                if cap > N {
+                    // NOTE: Bump capacity by about 33%, which is a hardcoded
+                    // heuristics, which might be worth revisiting
+                    self.grow(self.grow_by());
+                } else {
+                    self.heapify();
+                }
+                let &mut (heap_ptr, ref mut heap_len) = self.data.heap_mut();
+                ptr = heap_ptr;
+                len = heap_len;
+            }
+
+            ptr::write(ptr.add(*len), value);
+
+            *len += 1;
+        }
+    }
+
+    #[inline]
     pub fn pop(&mut self) -> Option<T> {
         unsafe {
-            if !self.is_empty() {
-                // This will never underflow, so no need to have checked sub
-                if self.is_heap_allocated() {
-                    self.data.heap.1 -= 1;
-                } else {
-                    self.capacity -= 1;
-                }
-
-                let value = ptr::read(self.ptr().add(self.len()));
-                Some(value)
-            } else {
-                None
+            let (ptr, len, _) = self.ptr_mut();
+            if *len == 0 {
+                return None;
             }
+
+            let last_index = *len - 1;
+            *len = last_index;
+
+            let value = ptr::read(ptr.add(last_index));
+            Some(value)
         }
     }
 }
@@ -120,18 +128,15 @@ where
     unsafe fn heapify(&mut self) -> Result<(), Error> {
         debug_assert!(self.cap() <= N, "Already heap allocated");
 
-        let cap = self.cap() + self.grow_by();
+        let (src, len, cap) = self.ptr();
+
+        let cap = cap + self.grow_by();
         let ptr = {
             let layout = Layout::array::<T>(cap).map_err(|_| Error::LayoutError)?;
             alloc(layout) as *mut T
         };
-        // NOTE: We take advantage that MaybeUninit<T> has the same layout and
-        // size as T and the fact that we allocated an N * T sized heap buffer.
-        // NOTE: No calling drop on T, since we still own the items, just movng them.
-        ptr::copy_nonoverlapping(&mut self.data.stack as *mut _ as *const T, ptr, N);
 
-        // NonNull is just a marker trait, so overwriting it should be equivalent
-        // to raw pointer assignment
+        ptr::copy_nonoverlapping(src, ptr, len);
 
         self.data.heap = (ptr, self.capacity);
         self.capacity = cap;
@@ -142,12 +147,13 @@ where
     unsafe fn grow(&mut self, additional: usize) -> Result<(), Error> {
         debug_assert!(self.capacity > N, "Not heap allocated");
 
-        let layout = Layout::array::<T>(self.cap()).map_err(|_| Error::LayoutError)?;
-        self.capacity = self
-            .cap()
+        let (ptr, len, mut cap) = self.ptr_mut();
+
+        let layout = Layout::array::<T>(cap).map_err(|_| Error::LayoutError)?;
+        cap = cap
             .checked_add(additional)
             .ok_or(Error::CapacityOverflow)?;
-        let size = Layout::array::<T>(self.cap())
+        let size = Layout::array::<T>(cap)
             .map_err(|_| Error::LayoutError)?
             .size();
 
@@ -158,31 +164,37 @@ where
             return Err(Error::CapacityOverflow);
         }
 
-        let ptr = realloc(self.data.heap.0 as *mut u8, layout, size) as *mut T;
-        self.data.heap.0 = ptr;
+        let ptr = realloc(ptr as *mut u8, layout, size) as *mut T;
+        self.data = Data { heap: (ptr, *len) };
+        self.capacity = cap;
 
         Ok(())
     }
 
-    pub(crate) unsafe fn ptr(&self) -> *const T {
-        if self.is_heap_allocated() {
-            self.data.heap.0 as *const T
+    #[inline(always)]
+    pub(crate) unsafe fn ptr(&self) -> (*const T, usize, usize) {
+        if self.capacity > N {
+            let (ptr, len) = self.data.heap;
+            (ptr, len, self.capacity)
         } else {
-            self.data.stack.as_ptr() as *const T
+            (self.data.stack(), self.capacity, N)
         }
     }
 
-    pub(crate) unsafe fn ptr_mut(&mut self) -> *mut T {
-        if self.is_heap_allocated() {
-            self.data.heap.0 as *mut T
+    #[inline(always)]
+    pub(crate) unsafe fn ptr_mut(&mut self) -> (*mut T, &mut usize, usize) {
+        if self.capacity > N {
+            let (ptr, ref mut len) = self.data.heap;
+            (ptr, len, self.capacity)
         } else {
-            (*self.data.stack).as_mut_ptr() as *mut T
+            (self.data.stack_mut(), &mut self.capacity, N)
         }
     }
 
+    #[inline(always)]
     // NOTE: This might be worth optimizing with another heuristics
     fn grow_by(&self) -> usize {
-        self.cap()
+        self.capacity
     }
 }
 
@@ -192,16 +204,16 @@ where
 {
     fn drop(&mut self) {
         unsafe {
-            for idx in 0..self.len() {
-                let ptr = self.ptr_mut().add(idx);
-                ptr::drop_in_place(ptr);
+            let (ptr, len, cap) = self.ptr_mut();
+            for idx in 0..*len {
+                ptr::drop_in_place(ptr.add(idx));
             }
-            if self.is_heap_allocated() {
+            if cap > N {
                 // NOTE: This is the current layout, this shouldn't fail.
                 // Unfortunately we don't have a way to gracefully report
                 // errors from drop.
-                let layout = Layout::array::<T>(self.capacity).unwrap();
-                dealloc(self.ptr_mut() as *mut u8, layout);
+                let layout = Layout::array::<T>(cap).unwrap();
+                dealloc(ptr as *mut u8, layout);
             }
         }
     }
