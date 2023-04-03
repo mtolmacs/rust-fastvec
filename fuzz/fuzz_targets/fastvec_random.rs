@@ -31,7 +31,7 @@ fn do_test<const N: usize>(data: &[u8]) -> FastVec<u8, N> {
             }
             1 => {
                 if v.len() < CAP_GROWTH {
-                    v.push(next_u8!(bytes)).unwrap()
+                    v.push(next_u8!(bytes))
                 }
             }
             2 => {
