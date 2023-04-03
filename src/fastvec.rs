@@ -2,7 +2,7 @@ use crate::{error::Error};
 use std::{
     alloc::{alloc, dealloc, realloc, Layout},
     mem::{ManuallyDrop, MaybeUninit},
-    ptr::{self, NonNull},
+    ptr,
 };
 
 union Data<T, const N: usize>
