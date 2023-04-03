@@ -1,7 +1,5 @@
 #![warn(missing_docs)]
 
-mod stack;
-
 /// Contains the error type and all error variations this crate can return
 pub mod error;
 
