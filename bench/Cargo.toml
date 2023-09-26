@@ -13,7 +13,9 @@ members = ["."]
 
 [dependencies]
 bma-benchmark = "0.0.20"
-smallvec = "1.10.0"
+smallvec = "1.11.1"
+arrayvec = "0.7.4"
+proc-macro2 = "1.0.67"
 
 [dependencies.fastvec]
 path = ".."
